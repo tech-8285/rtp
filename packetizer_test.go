@@ -211,6 +211,199 @@ func TestPacketizer_Empty_Payload(t *testing.T) {
 	}
 }
 
+func TestPacketizer_H264_StagedEncodingParamsDoNotEmitPlayoutTime(t *testing.T) {
+	// Drive the RTP packetizer across several calls while the H264 payloader
+	// stages SPS/PPS encoding parameters before the first video frame. Every
+	// input declares the same fixed sample duration, so the RTP timestamp is a
+	// deterministic running total regardless of whether the call emits packets.
+	const (
+		frameSamples = uint32(3000)
+		startTS      = uint32(50000)
+	)
+
+	// Minimal Annex B style NAL units: SPS (type 7), PPS (type 8), an IDR
+	// slice (type 5) and a non-IDR slice (type 1). SPS/PPS are retained by
+	// the payloader, the slices are small enough to be single NAL units here.
+	spsNALU := []byte{0x67, 0x00, 0x01}
+	ppsNALU := []byte{0x68, 0x02, 0x03}
+	idrNALU := []byte{0x65, 0x04, 0x05, 0x06}
+	pframeNALU := []byte{0x41, 0x07, 0x08}
+
+	pktizer := NewPacketizerWithOptions(
+		1500,
+		&codecs.H264Payloader{},
+		NewFixedSequencer(100),
+		90000,
+		WithSSRC(0x1234ABCD),
+		WithPayloadType(96),
+		WithTimestamp(startTS),
+	)
+	pktizerImpl, ok := pktizer.(*packetizer)
+	assert.True(t, ok, "Failed to cast to *packetizer")
+
+	// An SPS-only input updates the encoding parameters but produces no RTP
+	// packet. The media clock still advances by the declared sample duration.
+	spsPackets := pktizer.Packetize(spsNALU, frameSamples)
+	assert.Len(t, spsPackets, 0, "Staged SPS must not emit a packet")
+	assert.Equal(t, startTS+frameSamples, pktizerImpl.Timestamp, "SPS input must still advance media time")
+
+	// A PPS-only input behaves the same way: parameters are staged, no packet
+	// is emitted, and the declared duration is accounted for once.
+	ppsPackets := pktizer.Packetize(ppsNALU, frameSamples)
+	assert.Len(t, ppsPackets, 0, "Staged PPS must not emit a packet")
+	assert.Equal(t, startTS+2*frameSamples, pktizerImpl.Timestamp, "PPS input must advance media time")
+
+	// The following video frame carries the previously staged parameters. The
+	// STAP-A packet and the slice packet both belong to this single frame, so
+	// they share its playout timestamp; the staged parameter durations are
+	// already counted and must not be added again.
+	idrPackets := pktizer.Packetize(idrNALU, frameSamples)
+	assert.Len(t, idrPackets, 2, "IDR frame should be a STAP-A packet and a slice packet")
+	for i, pkt := range idrPackets {
+		assert.Equal(t, startTS+2*frameSamples, pkt.Timestamp, "IDR packet %d must use the frame timestamp", i)
+		assert.Equal(t, uint16(100+i), pkt.SequenceNumber, "IDR packet %d must consume the next sequence number", i)
+	}
+	assert.False(t, idrPackets[0].Marker, "Only the last packet of the frame may set the marker bit")
+	assert.True(t, idrPackets[1].Marker, "The last packet of the frame must set the marker bit")
+	assert.Equal(t, startTS+3*frameSamples, pktizerImpl.Timestamp, "The IDR frame must advance media time exactly once")
+
+	// An empty media input owns no transmission sequence number but its
+	// declared sample duration is still attributed to the media timeline.
+	emptyPackets := pktizer.Packetize(nil, frameSamples)
+	assert.Len(t, emptyPackets, 0, "Empty media input must not emit a packet")
+	assert.Equal(t, startTS+4*frameSamples, pktizerImpl.Timestamp, "Empty media input must advance media time")
+
+	// An explicit sample skip is another duration with no packets and no
+	// sequence numbers, and is likewise accounted for on the media timeline.
+	pktizer.SkipSamples(frameSamples)
+	assert.Equal(t, startTS+5*frameSamples, pktizerImpl.Timestamp, "Skipped samples must advance media time")
+
+	// The next video frame plays at the accumulated timestamp. Staging the
+	// parameters never created an independent playout frame, so there is no
+	// extra duration between the IDR frame and this one.
+	pframePackets := pktizer.Packetize(pframeNALU, frameSamples)
+	assert.Len(t, pframePackets, 1, "P frame should be a single slice packet")
+	assert.Equal(t, startTS+5*frameSamples, pframePackets[0].Timestamp, "P frame must play at the accumulated media time")
+	assert.Equal(t, uint16(102), pframePackets[0].SequenceNumber, "Empty and skipped inputs must not consume sequence numbers")
+	assert.True(t, pframePackets[0].Marker, "The single P frame packet must set the marker bit")
+	assert.Equal(t, startTS+6*frameSamples, pktizerImpl.Timestamp, "The P frame must advance media time exactly once")
+}
+
+func TestPacketizer_H264_PaddingFragmentationAndRollover(t *testing.T) {
+	// Exercise the transmission sequence (sequence numbers) independently of
+	// the media timeline (timestamps) across FU-A fragmentation, pure padding
+	// packets and 16/32 bit rollover, with a fixed sequencer and timestamp so
+	// the result does not depend on the clock or randomness.
+	const (
+		mtu          = uint16(21)
+		frameSamples = uint32(3000)
+	)
+	// A variable rather than a constant: the expected timestamps derived from
+	// it intentionally wrap at the uint32 boundary, which constant arithmetic
+	// would reject even though uint32 addition wraps at runtime.
+	startTS := uint32(0xFFFFFFFF - 4)
+
+	// SPS and PPS are deliberately tiny so the STAP-A packet (9 bytes) fits
+	// the payloader MTU (mtu-12 = 9), while both slice NAL units are large
+	// enough to be fragmented into FU-A packets with a 7 byte fragment size.
+	spsNALU := []byte{0x67, 0x00}
+	ppsNALU := []byte{0x68, 0x01}
+	// 16 bytes total: 15 fragmentable bytes split 7+7+1 into three FU-A packets.
+	idrNALU := []byte{
+		0x65, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+		0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+	}
+	// 11 bytes total: 10 fragmentable bytes split 7+3 into two FU-A packets.
+	pframeNALU := []byte{0x41, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39}
+
+	// Start the sequence number one step below the 16 bit wrap point.
+	pktizer := NewPacketizerWithOptions(
+		mtu,
+		&codecs.H264Payloader{},
+		NewFixedSequencer(0xFFFF),
+		90000,
+		WithSSRC(0x1234ABCD),
+		WithPayloadType(96),
+		WithTimestamp(startTS),
+	)
+	pktizerImpl, ok := pktizer.(*packetizer)
+	assert.True(t, ok, "Failed to cast to *packetizer")
+	seq, ok := pktizerImpl.Sequencer.(*sequencer)
+	assert.True(t, ok, "Failed to cast to *sequencer")
+
+	// Staged encoding parameters emit no packets and consume no sequence
+	// numbers, but each call still accounts for its declared duration.
+	assert.Len(t, pktizer.Packetize(spsNALU, frameSamples), 0, "Staged SPS must not emit a packet")
+	assert.Equal(t, startTS+frameSamples, pktizerImpl.Timestamp, "SPS input must advance media time")
+	assert.Len(t, pktizer.Packetize(ppsNALU, frameSamples), 0, "Staged PPS must not emit a packet")
+	assert.Equal(t, startTS+2*frameSamples, pktizerImpl.Timestamp, "PPS input must advance media time")
+	assert.Equal(t, uint64(0), seq.RollOverCount(), "Staged parameters must not consume sequence numbers")
+
+	// The first frame is one STAP-A packet plus three FU-A fragments. All
+	// four packets share the frame's playout timestamp, only the final
+	// fragment carries the marker bit, and the sequence numbers wrap once.
+	idrPackets := pktizer.Packetize(idrNALU, frameSamples)
+	assert.Len(t, idrPackets, 4, "IDR frame should be one STAP-A packet and three FU-A fragments")
+	expectedIDRSequences := []uint16{0xFFFF, 0x0000, 0x0001, 0x0002}
+	for i, pkt := range idrPackets {
+		assert.Equal(t, startTS+2*frameSamples, pkt.Timestamp, "IDR packet %d must share the frame timestamp", i)
+		assert.Equal(t, expectedIDRSequences[i], pkt.SequenceNumber, "IDR packet %d has an unexpected sequence number", i)
+		assert.False(t, pkt.Padding, "Media packets must not be padding")
+		assert.Equal(t, i == 3, pkt.Marker, "Only the last IDR fragment may set the marker bit")
+	}
+	assert.Equal(t, uint64(1), seq.RollOverCount(), "The sequence number must have rolled over once")
+	assert.Equal(t, byte(0x78), idrPackets[0].Payload[0], "The first packet must be a STAP-A NAL unit")
+	// FU-A indicator/headers: NRI 0x60 with type 28, then S/middle/E headers
+	// carrying the original IDR slice type (5).
+	assert.Equal(t, []byte{0x7c, 0x85}, idrPackets[1].Payload[:2], "First FU-A fragment must set the start bit")
+	assert.Equal(t, []byte{0x7c, 0x05}, idrPackets[2].Payload[:2], "Middle FU-A fragment must clear S and E bits")
+	assert.Equal(t, []byte{0x7c, 0x45}, idrPackets[3].Payload[:2], "Last FU-A fragment must set the end bit")
+	frame1TS := pktizerImpl.Timestamp
+	assert.Equal(t, startTS+3*frameSamples, frame1TS, "The fragmented frame must advance media time exactly once")
+
+	// Padding occupies the transmission sequence but must not move the media
+	// clock, must not carry a marker bit and must hold no media payload.
+	padding := pktizer.GeneratePadding(2)
+	assert.Len(t, padding, 2, "Should generate exactly two padding packets")
+	for i, pkt := range padding {
+		assert.True(t, pkt.Padding, "Padding packet %d must set the padding bit", i)
+		assert.False(t, pkt.Marker, "Padding packet %d must not set the marker bit", i)
+		assert.Nil(t, pkt.Payload, "Padding packet %d must not carry media payload", i)
+		assert.Equal(t, frame1TS, pkt.Timestamp, "Padding packet %d must reuse the latest media timestamp", i)
+		assert.Equal(t, uint16(0x0003+i), pkt.SequenceNumber, "Padding packet %d must consume a sequence number", i)
+	}
+	assert.Equal(t, frame1TS, pktizerImpl.Timestamp, "Padding must not advance media time")
+
+	// The next frame is fragmented into two packets. Its timestamp is the
+	// unchanged media clock (the padding added nothing), and the 32 bit
+	// timestamp wraps naturally as a uint32.
+	pframePackets := pktizer.Packetize(pframeNALU, frameSamples)
+	assert.Len(t, pframePackets, 2, "P frame should be two FU-A fragments")
+	expectedPTS := frame1TS
+	for i, pkt := range pframePackets {
+		assert.Equal(t, expectedPTS, pkt.Timestamp, "P frame packet %d must use the unwrapped media timestamp", i)
+		assert.Equal(t, uint16(0x0005+i), pkt.SequenceNumber, "P frame packet %d has an unexpected sequence number", i)
+		assert.Equal(t, i == 1, pkt.Marker, "Only the last P frame fragment may set the marker bit")
+	}
+	assert.Equal(t, []byte{0x5c, 0x81}, pframePackets[0].Payload[:2], "First P frame fragment must set the start bit")
+	assert.Equal(t, []byte{0x5c, 0x41}, pframePackets[1].Payload[:2], "Last P frame fragment must set the end bit")
+	assert.Equal(t, frame1TS+frameSamples, pktizerImpl.Timestamp, "The P frame must advance media time exactly once")
+
+	// Every emitted packet, including those past the sequence rollover, must
+	// survive a marshal/unmarshal round trip without losing header state.
+	for _, pkt := range append(append(idrPackets, padding...), pframePackets...) {
+		raw, err := pkt.Marshal()
+		assert.NoError(t, err)
+
+		var back Packet
+		assert.NoError(t, back.Unmarshal(raw))
+		assert.Equal(t, pkt.SequenceNumber, back.SequenceNumber)
+		assert.Equal(t, pkt.Timestamp, back.Timestamp)
+		assert.Equal(t, pkt.Padding, back.Padding)
+		assert.Equal(t, pkt.Marker, back.Marker)
+	}
+}
+
 func FuzzPacketizer_Packetize_G722(f *testing.F) {
 	// mixed seeds.
 	f.Add(uint16(100), uint8(98), uint32(0x1234ABCD), uint32(960), false, []byte{0})
