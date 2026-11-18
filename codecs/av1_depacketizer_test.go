@@ -592,3 +592,164 @@ func TestAV1Depacketizer_fragmentAllocationGrowth(t *testing.T) {
 	})
 	assert.Less(t, allocations, float64(64))
 }
+
+// requireRestoredAV1OBUs parses a depacketized low-overhead bitstream and
+// asserts that every OBU carries an explicit obu_size_field whose value
+// exactly matches the OBU payload, so each restored OBU has a well-defined
+// length and boundary. It returns the OBUs found, each including its header,
+// size field and payload.
+func requireRestoredAV1OBUs(t *testing.T, data []byte) [][]byte {
+	t.Helper()
+
+	var obus [][]byte
+	for offset := 0; offset < len(data); {
+		start := offset
+		header, err := obu.ParseOBUHeader(data[offset:])
+		require.NoError(t, err)
+		require.True(t, header.HasSizeField, "restored OBU must carry an explicit obu_size_field")
+		offset += header.Size()
+
+		obuSize, n, err := obu.ReadLeb128(data[offset:])
+		require.NoError(t, err)
+		offset += int(n)
+
+		end := offset + int(obuSize)
+		require.LessOrEqual(t, end, len(data), "declared OBU size exceeds the restored stream")
+		obus = append(obus, data[start:end])
+		offset = end
+	}
+
+	return obus
+}
+
+func TestAV1Depacketizer_fragmentedOBUExplicitBoundaries(t *testing.T) {
+	// A tile group OBU fragmented over three packets, followed by a complete
+	// frame header OBU in the last packet. The fragments mix the two length
+	// representations allowed by the aggregation header: explicit LEB128
+	// length fields and the omitted length form of the last OBU element
+	// when W != 0.
+	obuA, expectedA := createAV1OBU(obu.OBUTileGroup, []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08})
+	frag1 := obuA[:3]
+	frag2 := obuA[3:6]
+	frag3 := obuA[6:]
+	obuB, expectedB := createAV1OBU(obu.OBUFrameHeader, []byte{0x09, 0x0A, 0x0B})
+
+	depacketizer := AV1Depacketizer{}
+
+	// First fragment: Y=1, explicit LEB128 length field.
+	packet := append([]byte{0b01000000}, obu.WriteToLeb128(uint(len(frag1)))...)
+	packet = append(packet, frag1...)
+	out, err := depacketizer.Unmarshal(packet)
+	require.NoError(t, err)
+	assert.Empty(t, out, "incomplete OBU must not be delivered while waiting for fragments")
+
+	// Middle fragment: Z=1, Y=1, W=1. The fragment fills the rest of the
+	// packet, so its length is omitted and derived from the packet size.
+	packet = append([]byte{0b11010000}, frag2...)
+	out, err = depacketizer.Unmarshal(packet)
+	require.NoError(t, err)
+	assert.Empty(t, out, "incomplete OBU must not be delivered while waiting for fragments")
+
+	// Final fragment followed by a complete OBU: Z=1, W=2. The first OBU
+	// element (the final fragment) carries a LEB128 length field, the last
+	// element uses the omitted length form.
+	packet = append([]byte{0b10100000}, obu.WriteToLeb128(uint(len(frag3)))...)
+	packet = append(packet, frag3...)
+	packet = append(packet, obuB...)
+	out, err = depacketizer.Unmarshal(packet)
+	require.NoError(t, err)
+
+	restored := requireRestoredAV1OBUs(t, out)
+	require.Len(t, restored, 2)
+	assert.Equal(t, expectedA, restored[0], "fragmented OBU must be reassembled with explicit length and boundary")
+	assert.Equal(t, expectedB, restored[1], "omitted length form must not be mistaken for a truncated OBU")
+}
+
+func TestAV1Depacketizer_newSequenceDropsPendingFragment(t *testing.T) {
+	depacketizer := AV1Depacketizer{}
+
+	// Begin a fragmented OBU from the first coded video sequence.
+	staleFrag := []byte{0x22, 0xAA, 0xBB}
+	packet := append([]byte{0b01000000}, obu.WriteToLeb128(uint(len(staleFrag)))...)
+	packet = append(packet, staleFrag...)
+	out, err := depacketizer.Unmarshal(packet)
+	require.NoError(t, err)
+	assert.Empty(t, out)
+
+	// A packet with N=1 starts a new coded video sequence. The incomplete OBU
+	// from the previous sequence must be discarded, not prepended to the new
+	// sequence's OBUs.
+	seqHeader, expectedSeqHeader := createAV1OBU(obu.OBUSequenceHeader, []byte{0x01, 0x02})
+	packet = append([]byte{0b00011000}, seqHeader...) // N=1, W=1, omitted length
+	out, err = depacketizer.Unmarshal(packet)
+	require.NoError(t, err)
+	assert.Equal(t, expectedSeqHeader, out, "pending fragment from the previous sequence must not leak into the new one")
+
+	// A late continuation fragment (Z=1) belonging to the aborted sequence
+	// has no buffered start and must be dropped.
+	orphan := []byte{0xCC, 0xDD}
+	packet = append([]byte{0b10010000}, orphan...) // Z=1, W=1
+	out, err = depacketizer.Unmarshal(packet)
+	require.NoError(t, err)
+	assert.Empty(t, out, "continuation without a buffered start must be dropped")
+
+	// The new sequence continues to depacketize normally.
+	frame, expectedFrame := createAV1OBU(obu.OBUFrame, []byte{0x03, 0x04, 0x05})
+	packet = append([]byte{0b00010000}, frame...) // W=1, omitted length
+	out, err = depacketizer.Unmarshal(packet)
+	require.NoError(t, err)
+	assert.Equal(t, expectedFrame, out)
+}
+
+func TestAV1Depacketizer_waitingFragmentVsCorruptedPayload(t *testing.T) {
+	t.Run("waiting for continuation is not an error", func(t *testing.T) {
+		depacketizer := AV1Depacketizer{}
+		frag := []byte{0x22, 0x01, 0x02}
+		packet := append([]byte{0b01000000}, obu.WriteToLeb128(uint(len(frag)))...)
+		packet = append(packet, frag...)
+
+		out, err := depacketizer.Unmarshal(packet)
+		require.NoError(t, err)
+		assert.Empty(t, out, "a fragmented OBU waits for its continuation instead of failing")
+		assert.True(t, depacketizer.Y)
+	})
+
+	corrupted := []struct {
+		name   string
+		packet []byte
+		err    error
+	}{
+		{
+			name:   "length field exceeds payload",
+			packet: []byte{0b00000000, 0x05, 0x22, 0x01},
+			err:    errShortPacket,
+		},
+		{
+			name:   "W count larger than OBU elements",
+			packet: []byte{0b00110000, 0x01, 0x30},
+			err:    errShortPacket,
+		},
+		{
+			name:   "invalid LEB128 length field",
+			packet: []byte{0b00000000, 0xFF, 0xFF},
+			err:    obu.ErrFailedToReadLEB128,
+		},
+	}
+
+	for _, tt := range corrupted {
+		t.Run(tt.name, func(t *testing.T) {
+			depacketizer := AV1Depacketizer{}
+			out, err := depacketizer.Unmarshal(tt.packet)
+			require.ErrorIs(t, err, tt.err)
+			assert.Empty(t, out, "a corrupted payload must not be delivered as a complete video unit")
+
+			// The depacketizer recovers: the next intact OBU is delivered normally.
+			intact, expected := createAV1OBU(obu.OBUFrame, []byte{0x01, 0x02, 0x03})
+			packet := append([]byte{0b00000000}, obu.WriteToLeb128(uint(len(intact)))...)
+			packet = append(packet, intact...)
+			out, err = depacketizer.Unmarshal(packet)
+			require.NoError(t, err)
+			assert.Equal(t, expected, out)
+		})
+	}
+}

@@ -9,6 +9,7 @@ import (
 
 	"github.com/pion/rtp/codecs/av1/obu"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type testAV1AggregationHeader struct {
@@ -1844,6 +1845,97 @@ func TestAV1_depacketizer_to_packetizer(t *testing.T) {
 			assert.Equalf(t, payload, result, "Expected to packetize and depacketize to be the same for MTU=%d", mtu)
 		})
 	}
+}
+
+func TestAV1Payloader_fragmentationAggregationStateRoundTrip(t *testing.T) {
+	// A sequence header followed by a frame OBU that does not fit in a single
+	// packet, forcing fragmentation across multiple RTP packets.
+	framePayload := make([]byte, 300)
+	for i := range framePayload {
+		framePayload[i] = byte(i)
+	}
+	input := (testAV1MultiOBUsPayload{
+		{
+			Header:  &obu.Header{Type: obu.OBUSequenceHeader, HasSizeField: true},
+			Payload: []byte{0x01, 0x02, 0x03, 0x04},
+		},
+		{
+			Header:  &obu.Header{Type: obu.OBUFrame, HasSizeField: true},
+			Payload: framePayload,
+		},
+	}).Marshal()
+
+	const mtu = 64
+	packets := (&AV1Payloader{}).Payload(mtu, input)
+	require.Greater(t, len(packets), 2, "expected the frame OBU to be fragmented over multiple packets")
+
+	depacketizer := &AV1Depacketizer{}
+	restored := make([]byte, 0)
+	for i, packet := range packets {
+		assert.LessOrEqual(t, len(packet), mtu)
+
+		isFirst, isLast := i == 0, i == len(packets)-1
+		assert.Equal(t, !isFirst, packet[0]&0b10000000 != 0, "packet %d: Z must be set only on continuation fragments", i)
+		assert.Equal(t, !isLast, packet[0]&0b01000000 != 0, "packet %d: Y must be set until the final fragment", i)
+		assert.Equal(t, isFirst, packet[0]&0b00001000 != 0, "packet %d: N must be set only on the new sequence packet", i)
+
+		out, err := depacketizer.Unmarshal(packet)
+		require.NoError(t, err)
+
+		if !isLast {
+			// The fragmented frame OBU must not be delivered before its final
+			// fragment; only complete OBUs (the sequence header) may appear.
+			for _, restoredOBU := range requireRestoredAV1OBUs(t, out) {
+				header, parseErr := obu.ParseOBUHeader(restoredOBU)
+				require.NoError(t, parseErr)
+				require.NotEqual(t, obu.OBUFrame, header.Type, "packet %d: fragmented OBU delivered prematurely", i)
+			}
+		}
+		restored = append(restored, out...)
+	}
+
+	// Every restored OBU carries an explicit obu_size_field matching its
+	// payload, so boundaries are unambiguous and nothing was truncated.
+	restoredOBUs := requireRestoredAV1OBUs(t, restored)
+	require.Len(t, restoredOBUs, 2)
+	assert.Equal(t, input, restored)
+}
+
+func TestAV1Payloader_newSequenceStateRoundTrip(t *testing.T) {
+	// A second coded video sequence starts in the middle of the stream. The
+	// sequence header must begin a new packet carrying N=1, and no OBU from
+	// the previous sequence may share that packet.
+	input := (testAV1MultiOBUsPayload{
+		{
+			Header:  &obu.Header{Type: obu.OBUFrame, HasSizeField: true},
+			Payload: []byte{0x01, 0x02, 0x03},
+		},
+		{
+			Header:  &obu.Header{Type: obu.OBUSequenceHeader, HasSizeField: true},
+			Payload: []byte{0x04, 0x05},
+		},
+		{
+			Header:  &obu.Header{Type: obu.OBUFrame, HasSizeField: true},
+			Payload: []byte{0x06, 0x07, 0x08},
+		},
+	}).Marshal()
+
+	packets := (&AV1Payloader{}).Payload(1000, input)
+	require.Len(t, packets, 2)
+	assert.Zero(t, packets[0][0]&0b00001000, "first packet belongs to the previous sequence")
+	assert.NotZero(t, packets[1][0]&0b00001000, "packet starting the new sequence must set N")
+
+	depacketizer := &AV1Depacketizer{}
+	restored := make([]byte, 0)
+	for _, packet := range packets {
+		out, err := depacketizer.Unmarshal(packet)
+		require.NoError(t, err)
+		restored = append(restored, out...)
+	}
+
+	restoredOBUs := requireRestoredAV1OBUs(t, restored)
+	require.Len(t, restoredOBUs, 3)
+	assert.Equal(t, input, restored)
 }
 
 func TestAV1_Unmarshal_Error(t *testing.T) {
